@@ -1,0 +1,111 @@
+---
+weight: 11
+i18n:
+  title:
+    en: Release Notes
+title: Release Notes
+---
+
+# Release Notes
+
+## v1.3.10-acp.2
+
+Released 2026-10-01. Supported on Alauda Container Platform 4.1, 4.2, 4.3 and 4.4, on `amd64`
+and `arm64`.
+
+| Component | Version | Image |
+|---|---|---|
+| Operator | Milvus Operator 1.3.10 | `middleware/milvus-operator:v1.3.10-acp.2` |
+| Milvus engine | Milvus 2.6.24 | `middleware/milvus:v2.6.24-acp.2` |
+| etcd | 3.5.34 | `middleware/etcd:v1.3.10-acp.2` |
+| Silo (in-cluster object storage) | `RELEASE.2026-09-16T00-00-00Z` | `middleware/silo:v1.3.10-acp.2` |
+| mc (object storage client) | `RELEASE.2026-09-16T00-00-00Z` | `middleware/mc:v1.3.10-acp.2` |
+
+### New and Optimized Features
+
+- **OLM operator package.** The product is delivered as the OLM package `milvus-operator`,
+  display name **Alauda Data Services Vector Database E1**, channel `stable`, and installs
+  from **OperatorHub**. See [Installation](installation.mdx). For clusters that run the
+  `chart-milvus-operator` plugin, see
+  [Migrating from the chart plugin](upgrade.mdx#migrate-from-chart-plugin).
+- **Milvus Operator 1.3.10.** The operator is based on upstream Milvus Operator 1.3.10.
+  Changes since upstream 1.3.5 include:
+  - batch-based rollout and scaling;
+  - native HorizontalPodAutoscaler support;
+  - QueryNode, IndexNode and DataNode can be deployed as StatefulSets;
+  - deployment groups for components;
+  - external Pulsar with multiple endpoints;
+  - a Secret reference for Kafka SASL credentials, which also works with private CAs and
+    authorization-enabled Kafka clusters;
+  - the Kafka dependency check no longer depends on topic auto-creation;
+  - external Woodpecker LogStore (service mode);
+  - PVC expansion is skipped on a StorageClass that does not allow volume expansion;
+  - PVC reconciliation is skipped until the StatefulSet exists;
+  - CDC deployments are preserved when an instance changes from cluster to standalone mode;
+  - non-root live configuration and Silo storage;
+  - a fix for a port collision caused by MinIO service links;
+  - detection of Deployment template drift in manual mode.
+- **Milvus engine 2.6.24.** New instances run Milvus 2.6.24 by default. Milvus 2.6.24 is the
+  only engine version supported and tested with this release.
+- **Silo replaces MinIO for in-cluster object storage.** New instances with in-cluster
+  storage get Silo, an S3-compatible object store. Existing in-cluster MinIO releases are
+  kept and not converted.
+- **Images from the platform registry.** The operator takes the engine, etcd, Silo and mc
+  images from its OLM configuration, so they follow the platform's image registry, including
+  in disconnected environments.
+
+### Fixed Issues
+
+- **Milvus CRD rejected valid Ingress status.** The `Milvus` CRD schema required an `error`
+  field in the Ingress port status, so an Ingress status without an error failed validation.
+  The field is now optional.
+- **Operator-rendered pods were not compliant with Pod Security `restricted`.** Every
+  container the operator renders now sets `allowPrivilegeEscalation: false`, drops all
+  capabilities and uses the `RuntimeDefault` seccomp profile, and the in-cluster etcd and
+  Silo pods run as non-root. For the Milvus pods, set `spec.components.runAsNonRoot: true`;
+  see [Installation](installation.mdx#pod-security).
+- **The configuration init container pulled a public image.** On OLM installations the
+  Milvus pods' `config` init container now uses the operator's own image instead of a public
+  default image.
+
+### Security Fixes
+
+- **Milvus engine.** The engine's Go server binary and plan-parser library are rebuilt from
+  the upstream Milvus 2.6.24 source with raised Go modules: `google.golang.org/grpc` 1.83.2,
+  `github.com/apache/thrift` 0.24.0, `go.mongodb.org/mongo-driver` 1.17.7,
+  `github.com/gorilla/websocket` 1.5.3, AWS SDK `aws/protocol/eventstream` 1.7.8 and
+  `service/bedrockruntime` 1.50.4, OpenTelemetry 1.45.0, and `github.com/cilium/ebpf` 0.22.0.
+  The C++ core is unchanged. The Ubuntu packages `curl` / `libcurl4` are updated to
+  `7.81.0-1ubuntu1.29` and `openssl` / `libssl3` to `3.0.2-0ubuntu1.30`.
+- **etcd.** Rebuilt with `golang.org/x/crypto` 0.56.0 and OpenTelemetry 1.45.0.
+- **Operator.** The image is based on Alpine 3.22, with `libssl3` / `libcrypto3` `3.5.9-r0`.
+- **Silo and mc.** `coreutils` in the UBI 9 base is upgraded.
+
+At release, the images contain no critical vulnerabilities. Four high-severity
+vulnerabilities have no upstream fix yet: CVE-2026-86145, CVE-2026-89161 and CVE-2026-103111
+in `pcre2`, and CVE-2026-39414 in Silo.
+
+### Known Issues
+
+- **No GPU engine image.** This release delivers no GPU variant of the Milvus engine.
+- **The engine keeps `golang.org/x/crypto` 0.55.0** (CVE-2026-56855 and CVE-2026-78662,
+  medium severity). The fixed version needs Go 1.26, which upstream Milvus 2.6.x does not use.
+- **`MilvusUpgrade` without `spec.targetImage`.** If `spec.targetImage` is not set, it
+  defaults to `<base image>:v<targetVersion>`, built from the operator's default base image,
+  which may not be the engine image delivered with this release. Always set
+  `spec.targetImage` explicitly to the platform's `v2.6.x` engine image. See
+  [Upgrade the Milvus engine](upgrade.mdx#upgrade-the-milvus-engine).
+- **The engine image tag must stay `v2.6.x`.** The operator derives Milvus 2.6 behaviour from
+  the engine image tag. Do not retag the engine image with a tag that does not start with
+  `v2.6`.
+- **Cluster mode defaults to Pulsar.** Without `spec.dependencies.msgStreamType`, a
+  cluster-mode instance gets an in-cluster Pulsar, whose images are not delivered with this
+  release. Set `msgStreamType: woodpecker`, as in the
+  [cluster example](installation.mdx#cluster).
+- **Instances adopted from the chart plugin keep their engine version and in-cluster MinIO.**
+  Upgrading their engine to 2.6.24 is a separate action, and an adopted in-cluster MinIO is
+  not `restricted`-compliant. See [Upgrade](upgrade.mdx).
+
+---
+
+Milvus™ is a trademark of The Linux Foundation. Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by The Linux Foundation. All trademarks are the property of their respective owners and are used here for identification purposes only.

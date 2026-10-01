@@ -1,0 +1,380 @@
+---
+weight: 4
+i18n:
+  title:
+    en: Upgrade
+title: Upgrade
+---
+
+# Upgrade
+
+There are three different operations, and they are not the same:
+
+- **Upgrading the operator** of an OLM installation. OLM replaces the operator; your
+  instances keep running.
+- **Migrating from the chart plugin** `chart-milvus-operator` (last release 1.3.5) to this OLM
+  operator. This is a manual, one-way procedure.
+- **Upgrading the Milvus engine** of an instance. You change the instance's engine image;
+  this is never done for you by the two operations above.
+
+## Upgrade the operator
+
+The operator is delivered in the OLM channel `stable`. If the `Subscription` uses the
+**Automatic** upgrade strategy, OLM upgrades the operator as soon as a newer version is
+available in that channel. With **Manual**, an `InstallPlan` is created and waits for your
+approval: approve it in **Marketplace** > **OperatorHub**, or with `kubectl`:
+
+```shell
+kubectl get installplan -A | grep milvus-operator
+kubectl -n <operator-namespace> patch installplan <installplan-name> \
+  --type merge -p '{"spec":{"approved":true}}'
+```
+
+After the upgrade, check that the new ClusterServiceVersion reached `Succeeded` and that every
+instance returns to `Healthy`:
+
+```shell
+kubectl get csv -A | grep milvus-operator
+kubectl get milvus -A
+```
+
+## Migrating from the chart plugin (chart-milvus-operator 1.3.5) \{#migrate-from-chart-plugin\}
+
+:::danger Do not uninstall the chart plugin first
+The `chart-milvus-operator` plugin installs the three Milvus CRDs as part of its own release.
+**Uninstalling the plugin deletes the CRDs, and Kubernetes then deletes every Milvus instance
+of those kinds in every namespace.** Follow the steps below in the given order. Uninstall the
+plugin only after section 2 has been completed and verified.
+:::
+
+This procedure was tested end to end with v1.3.10-rc.116 on ACP 4.2.5: plugin
+`chart-milvus-operator` 1.3.5 to the OLM operator, with one standalone Milvus instance using
+in-cluster etcd and MinIO. Steps that were not tested are marked **(not tested)**.
+
+### 1. Scope
+
+- The OLM operator `milvus-operator` (*Alauda Data Services Vector Database E1*) supports new
+  installations. For clusters that already run Milvus through the `chart-milvus-operator`
+  plugin (last release 1.3.5), this section describes a **manual, one-way** migration.
+  - **There is no automated upgrade path** from the chart plugin to the OLM operator.
+  - Nothing in the product performs or checks these steps for you.
+  - There is **no chart release** that protects the CRDs for you. Section 2 is a manual step.
+- The migration moves only the **operator**. These stay where they are and are taken over by
+  the new operator:
+  - your Milvus instances (the `Milvus` / `MilvusCluster` custom resources);
+  - their PVCs and data;
+  - the etcd / MinIO dependencies the operator installed.
+
+Order (do not reorder):
+
+1. Take the CRDs out of the plugin's Helm release, and verify it.
+2. Back up.
+3. Uninstall the chart plugin.
+4. Install the OLM operator.
+5. Verify that the existing Milvus instances are adopted.
+
+### 2. Take the CRDs out of the plugin's Helm release
+
+#### Why this step exists
+
+The `chart-milvus-operator` chart (up to and including 1.3.5) installs the three CRDs
+(`milvuses.milvus.io`, `milvusclusters.milvus.io`, `milvusupgrades.milvus.io`) as ordinary
+Helm templates (gated by the value `installCRDs: true`).
+
+Uninstalling the plugin **deletes the CRDs**. Kubernetes then deletes **every custom resource
+of those kinds in every namespace**:
+
+- all three CRDs are deleted, and every Milvus custom resource is marked for deletion;
+- the platform's `captain-keep-resources: "true"` annotation on the plugin's HelmRequest does
+  **not** prevent this;
+- the resource then waits on the operator's finalizer. Any operator that later processes it
+  deletes the instance, and, depending on the instance's dependency `deletionPolicy`, its
+  in-cluster dependencies and their PVCs.
+
+#### What does not work on ACP
+
+- **`helm get manifest` / `helm upgrade` on the plugin release.** The platform's Helm
+  controller stores plugin releases in its own `releases.app.alauda.io` objects, not in Helm
+  Secrets. The `helm` CLI does not see the release.
+- **Editing the stored release** to add `helm.sh/resource-policy: keep`. The platform
+  re-renders the chart when it processes the uninstall, and on every resync, so the edit is
+  lost.
+- **Only annotating the live CRDs.** The uninstall works from the release, not from the live
+  objects.
+
+#### What works: keep the live CRDs, then remove them from the release
+
+Helm deletes objects that disappear from a release on upgrade, **unless the live object has
+`helm.sh/resource-policy: keep`**. So: annotate the live CRDs, then upgrade the plugin with
+`installCRDs: false`. The CRDs leave the release but stay in the cluster, and the later
+uninstall no longer touches them.
+
+1. Find the plugin. Its HelmRequest and Application have the same name:
+
+   ```shell
+   kubectl get helmrequests.app.alauda.io -A | grep chart-milvus-operator
+   ```
+
+   Note the name `<app>` and namespace `<ns>`. Every command below uses them.
+
+2. Annotate the three live CRDs:
+
+   ```shell
+   kubectl annotate crd milvuses.milvus.io milvusclusters.milvus.io milvusupgrades.milvus.io \
+     helm.sh/resource-policy=keep --overwrite
+   ```
+
+3. Upgrade the plugin with `installCRDs: false`, **keeping every other value you set**. In
+   the console, update the plugin's values and add `installCRDs: false`. With `kubectl`:
+
+   ```shell
+   v=$(kubectl -n <ns> get application <app> -o jsonpath='{.metadata.annotations.app\.cpaas\.io/chart\.values}')
+   new=$(printf '%s' "${v:-{\}}" | jq -c '. + {"installCRDs": false}')
+   kubectl -n <ns> annotate application <app> app.cpaas.io/chart.values="$new" --overwrite
+   ```
+
+   In testing, the new values reached the HelmRequest and a new release revision was written
+   within about 10 seconds. The operator Deployment kept running and no Milvus pod restarted.
+
+4. Verify. All three checks must pass:
+
+   ```shell
+   # a) the HelmRequest has the new value: prints {"installCRDs":false,...}
+   kubectl -n <ns> get helmrequest <app> -o jsonpath='{.spec.values}'; echo
+
+   # b) the deployed release no longer contains any CRD: prints 0
+   kubectl -n <ns> get releases.app.alauda.io -l name=<app>,status=deployed \
+     -o jsonpath='{.items[0].spec.manifestData}' | base64 -d | gunzip \
+     | grep -o 'kind: CustomResourceDefinition' | wc -l
+
+   # c) the three CRDs still exist and carry the keep annotation: prints keep 3 times
+   kubectl get crd milvuses.milvus.io milvusclusters.milvus.io milvusupgrades.milvus.io \
+     -o jsonpath='{range .items[*]}{.metadata.annotations.helm\.sh/resource-policy}{"\n"}{end}'
+   ```
+
+   If any check fails, **stop**. Do not uninstall the plugin.
+
+Do not change the plugin's values back afterwards. A later upgrade with `installCRDs: true`
+would put the CRDs back into the release.
+
+### 3. Back up
+
+The migration does not delete data when done in the order above, but take a backup before
+you start anyway:
+
+- **Object storage**: the MinIO / S3 bucket that holds the Milvus data.
+- **Metadata**: the etcd data used by each Milvus instance.
+- **Custom resources**: export every Milvus custom resource, for reference and for a manual
+  re-create if needed:
+
+  ```shell
+  kubectl get milvuses.milvus.io,milvusclusters.milvus.io,milvusupgrades.milvus.io -A -o yaml > milvus-crs-backup.yaml
+  ```
+
+The operator does not provide a general-purpose Milvus backup. The metadata backup that a
+`MilvusUpgrade` takes during a version upgrade is not a substitute for a full backup. Use your
+organisation's backup procedure for object storage and etcd.
+
+Record, for each instance, the image and the pod UIDs, so you can check in section 6 what was
+recreated:
+
+```shell
+kubectl get milvus -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,IMAGE:.spec.components.image,RUNASNONROOT:.spec.components.runAsNonRoot,STATUS:.status.status
+kubectl get pods -A -l app.kubernetes.io/instance -o custom-columns=NS:.metadata.namespace,POD:.metadata.name,UID:.metadata.uid,RESTARTS:.status.containerStatuses[0].restartCount | grep -E 'etcd|minio|milvus'
+```
+
+### 4. Uninstall the chart plugin
+
+Repeat checks 4b and 4c of section 2 first. Then uninstall the `chart-milvus-operator` plugin
+in the console. With `kubectl` this is `kubectl -n <ns> delete application <app>`.
+
+Expected result:
+
+- The operator Deployment, its RBAC, the HelmRequest and the release objects are gone.
+- The three CRDs are still present, without a deletion timestamp.
+- Every Milvus custom resource is still present, with the same UID and no deletion timestamp.
+- The instances' pods, PVCs and dependency releases (etcd / MinIO) keep running.
+- **The instances are unmanaged until section 5**: no reconciliation, no scaling, no
+  self-healing by the operator. Keep this window short and make no changes to the custom
+  resources during it.
+
+Do **not** run the chart plugin and the OLM operator at the same time. Both would reconcile
+the same resources, and leader election does not coordinate them because they run in
+different namespaces.
+
+### 5. Install the OLM operator
+
+#### 5.1 Remove the chart's conversion webhook from `milvuses.milvus.io` first
+
+The chart's `milvuses.milvus.io` CRD points its version conversion at the chart operator's
+webhook service. That service was removed in section 4.
+
+When OLM takes over an existing CRD, it first lists the existing custom resources in every
+version to validate them (see 5.2). Listing `v1alpha1` needs the conversion webhook, so
+**the install plan hangs in `Installing`** until this is fixed:
+
+```text
+error validating existing CRs against new CRD's schema for "milvuses.milvus.io": ...
+conversion webhook for milvus.io/v1beta1, Kind=Milvus failed: Post "https://<app>-milvus-operator-webhook-service.<ns>.svc:443/convert?timeout=30s": service ... not found
+```
+
+Before installing, set the strategy to `None`. The OLM bundle ships exactly that:
+
+```shell
+kubectl get crd milvuses.milvus.io -o jsonpath='{.spec.conversion.strategy}'; echo   # Webhook
+kubectl patch crd milvuses.milvus.io --type=json \
+  -p '[{"op":"replace","path":"/spec/conversion","value":{"strategy":"None"}}]'
+```
+
+If you already installed and the install plan hangs, run the patch then. OLM retries and the
+install completes (about 30 seconds in testing).
+
+#### 5.2 Install
+
+Install `milvus-operator` from **OperatorHub**, channel `stable`, as described in
+[Installation](installation.mdx#install-the-operator). It supports the **AllNamespaces**
+(cluster) install mode only.
+
+When OLM installs a CRD that already exists, it **updates** the existing CRD instead of
+failing. Before the update it:
+
+1. validates all existing custom resources against the new schema, and refuses the update if
+   any existing custom resource does not validate;
+2. refuses the update if the new CRD drops a version that is listed in the existing CRD's
+   `status.storedVersions`;
+3. then replaces the CRD with the bundle's definition.
+
+What this means for Milvus:
+
+- **Stored versions:** the bundle serves every version the chart served. Check yours before
+  installing:
+  `kubectl get crd milvuses.milvus.io -o jsonpath='{.status.storedVersions}'`.
+- **Schema:** a custom resource that the 1.3.5 operator accepted passed the validation in
+  testing.
+- **After the takeover** all three CRDs have conversion `None`, the OLM labels
+  (`olm.managed: "true"`), and no Helm metadata any more (the `keep` annotation and the
+  `meta.helm.sh/*` annotations are gone). Nothing needs to be removed by hand.
+
+If the install plan fails on a CRD step, that CRD is not changed and no custom resource is
+touched. Fix the cause and OLM retries, or roll back (section 6). **(Partial failures after an
+earlier CRD step: not tested.)**
+
+### 6. Verify that existing instances are adopted
+
+The new operator reconciles all existing Milvus custom resources. For each instance, check the
+following.
+
+- **Health:** `kubectl get milvus -A` shows `Healthy` again within a few minutes.
+- **The Milvus pods roll once.** The new operator renders the Milvus pods slightly differently
+  from the 1.3.5 operator. So each Milvus Deployment does **one rolling update**. The old pod
+  serves until the new one is ready.
+- **etcd and MinIO pods are not recreated.** Compare with the UIDs from section 3. They keep
+  their UIDs and restart counts.
+- **The engine image is unchanged.** `spec.components.image` still points to the engine image
+  that was running before (2.6.7 on chart 1.3.5), **not** the new operator's default 2.6.24.
+  The operator merges its defaults into an instance only once. Moving the engine to 2.6.24 is
+  a separate step; see [Upgrade the Milvus engine](#upgrade-the-milvus-engine).
+- **In-cluster MinIO stays MinIO.** New instances get Silo for in-cluster object storage. An
+  **existing** MinIO release is not converted: the operator keeps reconciling it with the
+  MinIO chart and the instance's own values. No data is moved.
+- **etcd / MinIO are not upgraded without cause.** The operator upgrades a dependency release
+  only when the values computed from the instance spec differ from the release's values, or
+  when the release status is Failed, Unknown or Uninstalled.
+- **The Milvus pods' `config` init container uses the operator image.** Check it:
+
+  ```shell
+  kubectl -n <instance-ns> get deploy -l app.kubernetes.io/instance=<instance> \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.template.spec.initContainers[?(@.name=="config")].image}{"\n"}{end}'
+  ```
+
+  It must show the `milvus-operator` image of the installed release, not
+  `milvusdb/milvus-operator:main-latest`. If you see `main-latest`, the new pod stays in
+  `Init:0/1` while the old pod keeps serving. Set `spec.components.updateToolImage: true` on
+  the instance once; the operator then re-renders the init container.
+- **Data:** read back something you wrote before the migration.
+- **Logs:** the operator's logs show no errors for the adopted instances.
+- **Consequence: an adopted in-cluster MinIO keeps its old pod spec.** That spec is **not**
+  Pod Security Standards `restricted` compliant (no `runAsNonRoot` / `seccompProfile`). It
+  keeps running in its current namespace. Moving that instance into a namespace that enforces
+  `restricted` needs a values-triggered upgrade of the MinIO release or a re-create of the
+  instance. **(not tested)**
+- **Milvus pods and restricted PSA:** the Milvus component pods are `restricted`-compatible
+  only when the instance sets `spec.components.runAsNonRoot: true`. The operator adds the
+  pod-level `runAsNonRoot` only in that case.
+
+#### Rollback
+
+Only possible while no new operator feature has been used:
+
+1. Uninstall the OLM operator (delete the Subscription and the ClusterServiceVersion). OLM
+   does not delete CRDs when an operator is uninstalled, so the custom resources stay.
+2. Re-install the `chart-milvus-operator` 1.3.5 plugin with `installCRDs: false`, so it does
+   not try to own the CRDs again. **(not tested)**
+
+Rollback is a recovery action, not a routine path. Test the whole migration on a
+non-production cluster first.
+
+### 7. Non-goals and known risks
+
+Non-goals:
+
+- No automated or in-place upgrade from the chart plugin to the OLM operator.
+- No new release of the chart plugin. Section 2 is a manual step on the installed 1.3.5.
+- No migration of the GPU image variant (no GPU engine image is delivered with this release).
+- No change of the Milvus engine version during the migration.
+- No data migration from an existing in-cluster MinIO to Silo.
+- No support for running the chart plugin and the OLM operator side by side.
+
+Known risks:
+
+- **Skipping or mis-verifying section 2** deletes all Milvus custom resources on uninstall.
+  This is the one irreversible mistake in this procedure.
+- **Unmanaged window:** between sections 4 and 5 no operator reconciles the instances.
+- **CRD update refused by OLM** (existing custom resources that fail the bundle schema, or a
+  stored version the bundle does not serve). The install stops; nothing is lost.
+- **Rollback is not guaranteed** (see above).
+- **Distributed in-cluster MinIO on chart plugin 1.3.5.** The embedded MinIO chart of 1.3.5
+  renders an invalid image reference in **distributed** mode (the operator's default MinIO
+  mode) whenever an image registry is set, so such an instance could never be installed on
+  1.3.5. There is therefore nothing of that kind to migrate. Standalone-mode MinIO and
+  external S3 were not affected.
+- **Restricted PSA after migration:** adopted in-cluster MinIO releases keep their
+  non-compliant pod spec, and Milvus pods are compliant only with
+  `spec.components.runAsNonRoot: true` (both described in section 6).
+
+## Upgrade the Milvus engine \{#upgrade-the-milvus-engine\}
+
+Neither an operator upgrade nor the chart migration changes the engine version of an existing
+instance. An instance adopted from chart plugin 1.3.5 keeps running Milvus 2.6.7. Moving it to
+Milvus 2.6.24, the version supported and tested with this release, is a separate action that
+you take per instance, after the migration has been verified.
+
+Set `spec.components.image` to the Milvus 2.6.24 engine image of this release,
+`middleware/milvus:v2.6.24-acp.2` in the platform image registry. The full reference the
+operator uses for new instances can be read from the operator Deployment:
+
+```shell
+kubectl get deploy -A -l app.kubernetes.io/name=milvus-operator \
+  -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="RELATED_IMAGE_MILVUS")].value}'; echo
+```
+
+Then update the instance, with a rolling update so that components are replaced in dependency
+order:
+
+```shell
+kubectl -n <instance-ns> patch milvus <instance> --type merge -p \
+  '{"spec":{"components":{"enableRollingUpdate":true,"image":"<engine-image-reference>"}}}'
+```
+
+Keep the image tag in the `v2.6.x` form. The operator derives Milvus 2.6 behaviour (for
+example the coordinator layout and the default message stream) from the engine image tag, so
+a tag that does not start with `v2.6` makes it deploy the instance incorrectly.
+
+If you use a `MilvusUpgrade` resource instead, always set `spec.targetImage` explicitly to the
+platform's `v2.6.x` engine image. Without it, `MilvusUpgrade` builds the image reference from
+`spec.targetVersion` and the operator's default base image, which may not be the image
+delivered with this release.
+
+---
+
+Milvus™ is a trademark of The Linux Foundation. Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by The Linux Foundation. All trademarks are the property of their respective owners and are used here for identification purposes only.

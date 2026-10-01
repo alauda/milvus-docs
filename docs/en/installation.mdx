@@ -1,0 +1,208 @@
+---
+weight: 3
+i18n:
+  title:
+    en: Installation
+title: Installation
+---
+
+# Installation
+
+Alauda Data Services Vector Database E1 is delivered as an OLM operator package. Installing it
+takes two separate steps: install the operator, then create a Milvus instance as a custom
+resource.
+
+::: warning Existing chart-plugin installations
+If the cluster already runs Milvus through the `chart-milvus-operator` cluster plugin, do not
+install this operator next to it, and do not uninstall the plugin first. Follow
+[Migrating from the chart plugin](upgrade.mdx#migrate-from-chart-plugin)
+instead.
+:::
+
+## Prerequisites
+
+- An Alauda Container Platform 4.1, 4.2, 4.3 or 4.4 cluster, `amd64` or `arm64`, with the
+  `milvus-operator` package uploaded to the platform.
+- Permission to install operators from **OperatorHub**.
+- A default `StorageClass`, or a named `StorageClass` that you reference from the instance.
+  Every in-cluster etcd member and object storage server claims a persistent volume.
+- Enough quota for the topology you create. The standalone example below runs 3 pods; the
+  cluster example runs 9.
+
+## Install the operator \{#install-the-operator\}
+
+<Tabs>
+  <Tab label="Web Console">
+    1. Log in to the platform and go to the **Platform Management** page.
+    2. In the left navigation bar, select **Marketplace** > **OperatorHub**.
+    3. Find **Alauda Data Services Vector Database E1**, click **Install**, and enter the deployment page.
+
+    Configuration Parameters:
+
+    | **Parameter** | **Recommended Configuration** |
+    | :------- | :---------------------------- |
+    | **Channel** | **stable** (the default channel). |
+    | **Version** | The latest version is selected by default. |
+    | **Installation Mode** | **Cluster**: one operator manages Milvus instances in all namespaces. This is the only supported mode. |
+    | **Installation Location** | Choose **Recommended Namespace**: automatically created if none exists. |
+    | **Upgrade Strategy** | **Manual**: a new version in OperatorHub needs manual confirmation before the operator is upgraded. |
+
+    4. Review the settings and click **Install**.
+  </Tab>
+</Tabs>
+
+Check that the operator is running:
+
+```shell
+kubectl get csv -A | grep milvus-operator
+# milvus-operator.v1.3.10-acp.2 ... Succeeded
+
+kubectl get crd milvuses.milvus.io milvusclusters.milvus.io milvusupgrades.milvus.io
+```
+
+## Create a Milvus instance
+
+Create the instance in a namespace of your choice. The examples do not set any image: the
+operator uses the Milvus engine, etcd and Silo images delivered with the operator, from the
+platform image registry. The engine version is Milvus 2.6.24.
+
+### Pod Security \{#pod-security\}
+
+Namespaces on Alauda Container Platform typically enforce the Pod Security Standard
+`restricted`. The operator renders every container it creates with the restricted settings
+(`allowPrivilegeEscalation: false`, all capabilities dropped, `seccompProfile:
+RuntimeDefault`), and the in-cluster etcd and Silo pods run as non-root users.
+
+For the Milvus pods themselves, set `spec.components.runAsNonRoot: true`, as both examples
+do. The operator then runs the Milvus containers as user `1000` and marks the pod
+`runAsNonRoot`. Without it, a namespace that enforces `restricted` rejects the Milvus pods.
+
+### Standalone
+
+All Milvus functions run in one pod, with a single-member etcd and a single Silo server. Use
+it for development, testing and small data sets.
+
+```yaml title="milvus-standalone.yaml"
+apiVersion: milvus.io/v1beta1
+kind: Milvus
+metadata:
+  name: milvus-standalone
+  namespace: <namespace>
+  labels:
+    app: milvus
+spec:
+  mode: standalone
+  components:
+    runAsNonRoot: true
+  dependencies:
+    # Metadata store: in-cluster etcd.
+    etcd:
+      inCluster:
+        values:
+          replicaCount: 1
+          persistence:
+            size: 5Gi
+    # Object storage: in-cluster Silo (S3-compatible).
+    storage:
+      type: MinIO
+      inCluster:
+        values:
+          mode: standalone
+          persistence:
+            size: 20Gi
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+  config:
+    milvus:
+      log:
+        level: info
+```
+
+`storage.type: MinIO` selects the S3-compatible storage protocol. The in-cluster server the
+operator installs for it is Silo.
+
+### Cluster \{#cluster\}
+
+Milvus functions run as separate components (Proxy, MixCoord, QueryNode, DataNode and
+StreamingNode), with a three-member etcd. The message stream is Woodpecker, which is part of
+the Milvus engine and needs no extra pods.
+
+```yaml title="milvus-cluster.yaml"
+apiVersion: milvus.io/v1beta1
+kind: Milvus
+metadata:
+  name: milvus-cluster
+  namespace: <namespace>
+  labels:
+    app: milvus
+spec:
+  mode: cluster
+  components:
+    runAsNonRoot: true
+  dependencies:
+    # Message stream: Woodpecker, built into Milvus 2.6.
+    # Without this line cluster mode defaults to an in-cluster Pulsar,
+    # whose images are not delivered with this release.
+    msgStreamType: woodpecker
+    # Metadata store: in-cluster etcd.
+    etcd:
+      inCluster:
+        values:
+          replicaCount: 3
+          persistence:
+            size: 10Gi
+    # Object storage: in-cluster Silo (S3-compatible).
+    storage:
+      type: MinIO
+      inCluster:
+        values:
+          mode: standalone
+          persistence:
+            size: 50Gi
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+  config:
+    milvus:
+      log:
+        level: info
+    component:
+      proxy:
+        timeTickInterval: 150
+```
+
+To use an external S3-compatible service or an external Kafka or Pulsar instead, see the
+`spec.dependencies` reference of the `Milvus` custom resource.
+
+### Apply and check
+
+```shell
+kubectl apply -f milvus-standalone.yaml
+
+# Wait until the instance reports Healthy (a few minutes on first start).
+kubectl -n <namespace> get milvus milvus-standalone
+
+kubectl -n <namespace> get pods -l app.kubernetes.io/instance=milvus-standalone
+```
+
+When the status is `Healthy`, clients connect to the Service `<instance-name>-milvus` on port
+`19530` (gRPC and REST), for example `milvus-standalone-milvus.<namespace>.svc:19530`.
+
+### Deleting an instance
+
+Deleting the `Milvus` resource removes the Milvus pods. With the defaults, the in-cluster
+etcd and object storage releases and their persistent volumes are **kept**
+(`deletionPolicy: Retain`). To remove them together with the instance, set
+`deletionPolicy: Delete` and `pvcDeletion: true` under
+`spec.dependencies.etcd.inCluster` and `spec.dependencies.storage.inCluster` before you delete
+it.
+
+---
+
+Milvus™ is a trademark of The Linux Foundation. Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by The Linux Foundation. All trademarks are the property of their respective owners and are used here for identification purposes only.

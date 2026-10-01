@@ -1,0 +1,102 @@
+---
+weight: 1
+i18n:
+  title:
+    en: Introduction
+title: Introduction
+---
+
+# Introduction
+
+Alauda Data Services Vector Database E1 deploys and manages Milvus™ vector database instances
+on Alauda Container Platform. It is built on the open-source
+[Milvus Operator](https://github.com/zilliztech/milvus-operator) project, version 1.3.10, with
+changes for Alauda Container Platform: platform image delivery, Pod Security "restricted"
+defaults and an OLM package.
+
+## What it is
+
+Milvus is a database for storing, indexing and searching vector embeddings, for example for
+similarity search and retrieval-augmented generation. The operator turns a `Milvus` custom
+resource into a running database: it renders the Milvus Deployments, Services and
+ConfigMaps, installs the in-cluster dependencies the instance asks for, and reconciles them
+when you change the resource.
+
+The operator owns these custom resources, all in API group `milvus.io`:
+
+| Kind | Version | Purpose |
+|---|---|---|
+| `Milvus` | `v1beta1` | One Milvus instance, in standalone or cluster mode |
+| `MilvusUpgrade` | `v1beta1` | A managed engine version upgrade of an existing instance |
+| `MilvusCluster` | `v1alpha1` | Legacy cluster-mode API, kept for compatibility |
+
+New instances should use `Milvus` (`milvus.io/v1beta1`).
+
+## Architecture
+
+An instance consists of the Milvus engine and three kinds of dependencies: a metadata store,
+object storage and a message stream (write-ahead log).
+
+### Deployment modes
+
+- **Standalone.** All Milvus functions run in one pod. Suitable for development, testing and
+  small data sets.
+- **Cluster.** Milvus functions run as separate, independently scalable components. With the
+  Milvus 2.6 engine the operator creates:
+
+  | Component | Role |
+  |---|---|
+  | Proxy | Client entry point; serves the gRPC and REST API on port `19530` |
+  | MixCoord | Combined coordinator for metadata, data, query and index scheduling |
+  | QueryNode | Loads segments and serves searches and queries |
+  | DataNode | Flushes, compacts and indexes data |
+  | StreamingNode | Hosts the write-ahead log streams |
+
+Clients connect to the Service `<instance-name>-milvus` on port `19530`. Metrics are exposed
+on port `9091`.
+
+### Dependencies
+
+| Dependency | In-cluster default | External option |
+|---|---|---|
+| Metadata store | etcd, installed by the operator | An existing etcd cluster |
+| Object storage | Silo, an S3-compatible object store installed by the operator | Any S3-compatible service |
+| Message stream | Woodpecker, the write-ahead log built into Milvus 2.6 | Kafka or Pulsar that you operate |
+
+Silo replaces MinIO as the in-cluster object storage for new instances. Instances that
+already use an in-cluster MinIO release keep it; see [Upgrade](upgrade.mdx).
+
+In standalone mode the message stream defaults to Woodpecker. In cluster mode set
+`spec.dependencies.msgStreamType: woodpecker` explicitly, as the examples in
+[Installation](installation.mdx) do; otherwise the operator defaults to an in-cluster Pulsar,
+whose images are not delivered with this release.
+
+## Platform support
+
+| Item | Supported |
+|---|---|
+| Alauda Container Platform | 4.1, 4.2, 4.3, 4.4 |
+| Architectures | `amd64`, `arm64` |
+| Kubernetes | 1.25 or later |
+| Milvus engine | 2.6.24 |
+| Install mode | All namespaces: one operator manages instances in every namespace |
+
+## Versions
+
+| Component | Image | Version |
+|---|---|---|
+| Operator | `middleware/milvus-operator:v1.3.10-acp.2` | Milvus Operator 1.3.10 |
+| Milvus engine | `middleware/milvus:v2.6.24-acp.2` | Milvus 2.6.24 |
+| Metadata store | `middleware/etcd:v1.3.10-acp.2` | etcd 3.5.34 |
+| Object storage | `middleware/silo:v1.3.10-acp.2` | Silo `RELEASE.2026-09-16T00-00-00Z` |
+| Object storage client | `middleware/mc:v1.3.10-acp.2` | mc `RELEASE.2026-09-16T00-00-00Z` |
+| OLM package | `milvus-operator`, channel `stable` | `v1.3.10-acp.2` |
+
+Images are delivered through the platform image registry. You do not need to set image
+references in a `Milvus` resource: the operator fills them in from its own configuration.
+
+No GPU engine image is delivered with this release.
+
+---
+
+Milvus™ is a trademark of The Linux Foundation. Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by The Linux Foundation. All trademarks are the property of their respective owners and are used here for identification purposes only.

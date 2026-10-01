@@ -349,6 +349,9 @@ instance. An instance adopted from chart plugin 1.3.5 keeps running Milvus 2.6.7
 Milvus 2.6.24, the version supported and tested with this release, is a separate action that
 you take per instance, after the migration has been verified.
 
+The engine upgrade from 2.6.7 to 2.6.24 itself was **not tested** with this release. Try it on
+a non-production instance first, and back up as described in section 3.
+
 Set `spec.components.image` to the Milvus 2.6.24 engine image of this release,
 `middleware/milvus:v2.6.24-acp.2` in the platform image registry. The full reference the
 operator uses for new instances can be read from the operator Deployment:

@@ -121,7 +121,8 @@ spec:
 ```
 
 `storage.type: MinIO` selects the S3-compatible storage protocol. The in-cluster server the
-operator installs for it is Silo.
+operator installs for it is Silo. Its Deployment, Service and PVC keep the historical name
+`<instance-name>-minio`, but the container runs the Silo image.
 
 ### Cluster \{#cluster\}
 
